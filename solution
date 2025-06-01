@@ -1,0 +1,591 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "0c75c2ff",
+   "metadata": {},
+   "source": [
+    "The following presents the code used in experiments for demand forecasting within a large FMCG company, utilizing both classical and advanced methods, including time series analysis, regression modeling, and deep learning.\n",
+    "\n",
+    "The data cannot be shared publicly due to confidentiality restrictions, as it contains proprietary information from a commercial company.\n",
+    "\n",
+    "The source data consisted of a pre-processed dataset extracted from an internal corporate system.The study was conducted based on historical sales data from a large FMCG company for the period 2022–2025. The dataset included 200 product items sold through one of the key clients — a major retailer. All data were converted into a weekly format (52 weeks per year), allowing for short-term demand fluctuations related to marketing activities, seasonality, and other factors to be taken into account. For each \"product-week\" combination, the following parameters were collected:\n",
+    "- Sell-In (SI) — volume of shipments from the company to the client (in units)  \n",
+    "- Sell-Out (SO) — volume of product sales to the end consumer (in units)  \n",
+    "- Price: historical and expected prices of the product (in rubles per unit)  \n",
+    "- Promotions: presence or absence of seven types of marketing activities (boolean value for each type)  \n",
+    "- Seasonal factors: week number in the year, position in the time series (to account for long-term trends)  \n",
+    "- Stock levels: inventory levels at the client’s site at the beginning of the week (in units)   \n",
+    "\n",
+    "The notebook file is the result of an iterative experimental process not only within the Jupyter Notebook environment but also in VSCode (for instance, more complex LSTM model architectures were evaluated within the VSCode environment to enable a more controlled and prolonged training process). \n",
+    "\n",
+    "Therefore, the final code does not include the entire process of parameter tuning and testing of various solutions. This version presents only the final, most optimal models with their best-tuned parameters.\n",
+    "\n",
+    "It should be noted that the provided code serves only as a demonstration version of the conducted experiments. The final software solution intended for integration into existing business processes significantly differs from the presented one. The production-ready implementation accounts for specific requirements of corporate infrastructure, including system integrations, data security policies, and compliance with internal IT standards."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "e3a8d1b7",
+   "metadata": {},
+   "source": [
+    "# Import Requirement Libraries"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "63010b3d",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import pandas as pd\n",
+    "import numpy as np\n",
+    "from sklearn.metrics import mean_squared_error, mean_absolute_error, make_scorer\n",
+    "from sklearn.ensemble import RandomForestRegressor\n",
+    "from sklearn.linear_model import LinearRegression\n",
+    "from sklearn.preprocessing import StandardScaler\n",
+    "from sklearn.model_selection import cross_val_score, KFold\n",
+    "import statsmodels\n",
+    "from statsmodels.tsa.statespace.sarimax import SARIMAX\n",
+    "from statsmodels.tsa.holtwinters import ExponentialSmoothing\n",
+    "from statsmodels.tsa.stattools import adfuller\n",
+    "from statsmodels.tsa.seasonal import seasonal_decompose\n",
+    "from statsmodels.graphics.tsaplots import plot_acf, plot_pacf\n",
+    "from xgboost import XGBRegressor\n",
+    "from keras.models import Sequential\n",
+    "from keras.layers import LSTM, Dense\n",
+    "import matplotlib.pyplot as plt\n",
+    "import seaborn as sns\n",
+    "import time\n",
+    "import warnings\n",
+    "warnings.filterwarnings('ignore')\n",
+    "\n",
+    "def custom_accuracy(y_true, y_pred):\n",
+    "    return 1 - (np.abs(y_true - y_pred).sum() / y_true.sum())"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "dd27761f",
+   "metadata": {},
+   "source": [
+    "# Loading And Transforming Data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "c73f3755",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df = pd.read_excel('Data.xlsx', sheet_name='result')\n",
+    "\n",
+    "# Converting to date type and filter for today date\n",
+    "df['Calendar Year/Week'] = pd.to_datetime(\n",
+    "    df['Calendar Year/Week'].astype(str) + '-1', \n",
+    "    format='%W.%Y-%w'\n",
+    ")\n",
+    "current_date = time.strftime(\"%Y-%m-%d\")\n",
+    "df = df[df['Calendar Year/Week'] < current_date].copy()\n",
+    "\n",
+    "df = df.rename({'EA': 'SI'}, axis=1)\n",
+    "\n",
+    "# Creating lags for dependent value - SellOut\n",
+    "def create_lags(group):\n",
+    "    for lag in range(1, 5):\n",
+    "        group[f'SO_lag{lag}'] = group['SO'].shift(lag)\n",
+    "    return group\n",
+    "\n",
+    "df = df.groupby('DP Group').apply(create_lags).reset_index(drop=True)\n",
+    "df = df.dropna(subset=[f'SO_lag{i}' for i in range(1,5)]).copy()\n",
+    "\n",
+    "# Selecting the last 12 weeks for the test sample\n",
+    "all_weeks = df['Calendar Year/Week'].unique()\n",
+    "last_12_weeks = np.sort(all_weeks)[-12:]\n",
+    "\n",
+    "product_mask = []\n",
+    "for product, group in df.groupby('DP Group'):\n",
+    "    # Selecting products that have at least 24 weeks of sales\n",
+    "    if len(group) < 24:\n",
+    "        continue\n",
+    "    test_period_data = group[group['Calendar Year/Week'].isin(last_12_weeks)]\n",
+    "    # Counting the number of weeks a product has sales in the test period is 12 weeks\n",
+    "    valid_sales = (test_period_data['SO'] > 0).sum()\n",
+    "    # Filtering products based on the availability of at least 8 weeks of sales in the test period\n",
+    "    if valid_sales >= 8:\n",
+    "        product_mask.append(product)\n",
+    "\n",
+    "df_filtered = df[df['DP Group'].isin(product_mask)].copy()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "c58d66ac",
+   "metadata": {},
+   "source": [
+    "# Preparing Features For Models"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "fd4ddb85",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Train/test split (test - last 12 weeks)\n",
+    "train = df_filtered.groupby('DP Group').apply(\n",
+    "    lambda x: x[~x['Calendar Year/Week'].isin(last_12_weeks)]\n",
+    ").reset_index(drop=True)\n",
+    "\n",
+    "test = df_filtered.groupby('DP Group').apply(\n",
+    "    lambda x: x[x['Calendar Year/Week'].isin(last_12_weeks)]\n",
+    ").reset_index(drop=True)\n",
+    "\n",
+    "# Preparing features for regression models\n",
+    "features = [col for col in train.columns if col not in ['SI', 'SO', 'Calendar Year/Week', 'DP Group']]\n",
+    "X_train = train[features]\n",
+    "y_train = train['SO']\n",
+    "X_test = test[features]\n",
+    "y_test = test['SO']\n",
+    "\n",
+    "# Standart scaler for numeric values\n",
+    "scaler = StandardScaler()\n",
+    "X_train_scaled = scaler.fit_transform(X_train)\n",
+    "X_test_scaled = scaler.transform(X_test)\n",
+    "\n",
+    "# Preparing features for time series analysis\n",
+    "so_by_week = df_filtered.groupby('Calendar Year/Week')['SO'].sum().reset_index()\n",
+    "so_by_week = so_by_week.set_index('Calendar Year/Week')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "fb22a34a",
+   "metadata": {},
+   "source": [
+    "# Time Series Models"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "09198a03",
+   "metadata": {},
+   "source": [
+    "### Checking for stationarity with the Dickey-Fuller test"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "bf9984d1",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def adf_test(series):\n",
+    "    \"\"\"Dickey-Fuller test\"\"\"\n",
+    "    result = adfuller(series)\n",
+    "    print('ADF Statistic: %f' % result[0])\n",
+    "    print('p-value: %f' % result[1])\n",
+    "    print('Critical Values:')\n",
+    "    for key, value in result[4].items():\n",
+    "        print('\\t%s: %.3f' % (key, value))\n",
+    "    return result[1] <= 0.05  # True for stationarity time series\n",
+    "\n",
+    "so_series = so_by_week['SO']\n",
+    "is_stationary = adf_test(so_series)\n",
+    "\n",
+    "# Decomposed time series\n",
+    "decomposition = seasonal_decompose(so_series, period=52)\n",
+    "decomposition.plot()\n",
+    "plt.suptitle('Decomposition of a time series: Trend, Seasonality, Remainder')\n",
+    "plt.tight_layout()\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "45800fc4",
+   "metadata": {},
+   "source": [
+    "### SARIMA"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "94997016",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Fitting SARIMA (ARIMA + Seasonal)\n",
+    "model_arima = SARIMAX(so_series, \n",
+    "                      order=(2,1,2), # base ARIMA parameters\n",
+    "                      seasonal_order=(1,1,1,52)) # seasonal part\n",
+    "results_arima = model_arima.get_forecast(steps=12)\n",
+    "\n",
+    "# prediction\n",
+    "pred_mean = results_arima.predicted_mean\n",
+    "\n",
+    "# Metrics for Test dataset\n",
+    "y_true = y_test.values[-12:]\n",
+    "y_pred = pred_mean.values\n",
+    "\n",
+    "metrics_arima = {\n",
+    "    'accuracy': 1 - (np.abs(y_true - y_pred).sum() / y_true.sum()),\n",
+    "    'mse': mean_squared_error(y_true, y_pred),\n",
+    "    'mae': mean_absolute_error(y_true, y_pred),\n",
+    "    'aic': model_arima.aic\n",
+    "}\n",
+    "\n",
+    "# Residuals\n",
+    "residuals = model_arima.filter(so_series).resid\n",
+    "\n",
+    "# Residuals plot\n",
+    "plt.figure(figsize=(12, 4))\n",
+    "plt.plot(residuals)\n",
+    "plt.title('Residuals  SARIMA')\n",
+    "plt.grid(True)\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n",
+    "\n",
+    "# ACF and PACF\n",
+    "fig, ax = plt.subplots(2, figsize=(12, 6))\n",
+    "plot_acf(residuals, lags=40, ax=ax[0])\n",
+    "plot_pacf(residuals, lags=40, ax=ax[1])\n",
+    "plt.suptitle('Correlogram SARIMA')\n",
+    "plt.tight_layout()\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "58c0eb85",
+   "metadata": {},
+   "source": [
+    "### Holt-Winters' Model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "db6fd4fe",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Executing HW' model\n",
+    "model_hw = ExponentialSmoothing(so_series, \n",
+    "                               trend='add', \n",
+    "                               seasonal='mul', \n",
+    "                               seasonal_periods=52)\n",
+    "results_hw = model_hw.fit()\n",
+    "\n",
+    "# Prediction\n",
+    "pred_hw = results_hw.forecast(12)\n",
+    "\n",
+    "# Metrics for Test dataset\n",
+    "y_true = y_test.values[-12:]\n",
+    "y_pred = pred_hw.values\n",
+    "\n",
+    "metrics_hw = {\n",
+    "    'accuracy': 1 - (np.abs(y_true - y_pred).sum() / y_true.sum()),\n",
+    "    'mse': mean_squared_error(y_true, y_pred),\n",
+    "    'mae': mean_absolute_error(y_true, y_pred),\n",
+    "    'aic': results_hw.aic\n",
+    "}"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "c3f6a0fa",
+   "metadata": {},
+   "source": [
+    "# Regression Models"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "acee0812",
+   "metadata": {},
+   "source": [
+    "### Linear Regression"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "50a9e3a2",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "model_lr = LinearRegression()\n",
+    "model_lr.fit(X_train_scaled, y_train)\n",
+    "y_pred = model_lr.predict(X_test_scaled)\n",
+    "\n",
+    "metrics_lr = {\n",
+    "    'accuracy': 1 - (np.abs(y_test - y_pred).sum() / y_test.sum()),\n",
+    "    'mse': mean_squared_error(y_test, y_pred),\n",
+    "    'mae': mean_absolute_error(y_test, y_pred)\n",
+    "}"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "8ee168a8",
+   "metadata": {},
+   "source": [
+    "### XGBoost"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "eaaf4ddc",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Initialize XGBoost Regressor with fixed hyperparameters\n",
+    "model_xgb = XGBRegressor(\n",
+    "    n_estimators=100,\n",
+    "    learning_rate=0.1,\n",
+    "    max_depth=5,\n",
+    "    random_state=42,\n",
+    "    tree_method='hist',\n",
+    "    enable_categorical=False\n",
+    ")\n",
+    "\n",
+    "# Configure 5-fold cross-validation\n",
+    "cv = KFold(n_splits=5, shuffle=False)\n",
+    "\n",
+    "# Evaluate model using cross-validation and the custom accuracy metric\n",
+    "custom_scorer = make_scorer(custom_accuracy, greater_is_better=True)\n",
+    "\n",
+    "# Perform cross-validation\n",
+    "cv_scores = cross_val_score(\n",
+    "    estimator=model_xgb,\n",
+    "    X=X_train_scaled,\n",
+    "    y=y_train,\n",
+    "    cv=cv,\n",
+    "    scoring=custom_scorer,\n",
+    "    n_jobs=-1\n",
+    ")\n",
+    "print('XGBoost')\n",
+    "print(f\"Cross-validation Accuracy scores per fold: {cv_scores}\")\n",
+    "print(f\"Mean Cross-validation Accuracy: {cv_scores.mean():.4f}\")\n",
+    "\n",
+    "# Train the final model on the full training set\n",
+    "model_xgb.fit(X_train_scaled, y_train)\n",
+    "\n",
+    "# Predict on test dataset\n",
+    "y_pred = model_xgb.predict(X_test_scaled)\n",
+    "\n",
+    "# Metrics for Test dataset\n",
+    "metrics_xgb = {\n",
+    "    'accuracy': custom_accuracy(y_test, y_pred),\n",
+    "    'mse': mean_squared_error(y_test, y_pred),\n",
+    "    'mae': mean_absolute_error(y_test, y_pred)\n",
+    "}"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "1a2a4cc6",
+   "metadata": {},
+   "source": [
+    "### Random Forest"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "fac41a3a",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "model_rf = RandomForestRegressor(\n",
+    "    n_estimators=100,\n",
+    "    random_state=42,\n",
+    "    n_jobs=-1\n",
+    ")\n",
+    "\n",
+    "cv = KFold(n_splits=5, shuffle=False)\n",
+    "\n",
+    "# Evaluate using cross-validation\n",
+    "cv_scores = cross_val_score(\n",
+    "    estimator=model_rf,\n",
+    "    X=X_train_scaled,\n",
+    "    y=y_train,\n",
+    "    cv=cv,\n",
+    "    scoring=custom_scorer,\n",
+    "    n_jobs=-1\n",
+    ")\n",
+    "print('RANDOM FOREST')\n",
+    "print(f\"Cross-validation Accuracy scores per fold: {cv_scores}\")\n",
+    "print(f\"Mean Cross-validation Accuracy: {cv_scores.mean():.4f}\")\n",
+    "\n",
+    "\n",
+    "# Train final model on full training set\n",
+    "model_rf.fit(X_train_scaled, y_train)\n",
+    "\n",
+    "# Predict on test dataset\n",
+    "y_pred = model_rf.predict(X_test_scaled)\n",
+    "\n",
+    "metrics_rf = {\n",
+    "    'accuracy': 1 - (np.abs(y_test - y_pred).sum() / y_test.sum()),\n",
+    "    'mse': mean_squared_error(y_test, y_pred),\n",
+    "    'mae': mean_absolute_error(y_test, y_pred)\n",
+    "}\n",
+    "\n",
+    "# Feature Importance Visualization\n",
+    "feature_importance = model_rf.feature_importances_\n",
+    "sorted_idx = np.argsort(feature_importance)\n",
+    "plt.figure(figsize=(10, 6))\n",
+    "plt.barh(range(len(sorted_idx)), feature_importance[sorted_idx], align='center')\n",
+    "plt.yticks(range(len(sorted_idx)), np.array(features)[sorted_idx])\n",
+    "plt.title(\"Feature Importance from Random Forest\")\n",
+    "plt.xlabel(\"Importance Score\")\n",
+    "plt.tight_layout()\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "efc06994",
+   "metadata": {},
+   "source": [
+    "# Deep Learning"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "497302df",
+   "metadata": {},
+   "source": [
+    "### LSTM-network"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "e1119a8c",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Transforming data as sequences\n",
+    "def create_sequences(data, seq_length=4):\n",
+    "    xs, ys = [], []\n",
+    "    for i in range(len(data)-seq_length):\n",
+    "        x = data[i:(i+seq_length)]\n",
+    "        y = data[i+seq_length]\n",
+    "        xs.append(x)\n",
+    "        ys.append(y)\n",
+    "    return np.array(xs), np.array(ys)\n",
+    "\n",
+    "scaler_lstm = StandardScaler()\n",
+    "so_data = df_filtered.groupby('Calendar Year/Week')['SO'].sum().values.reshape(-1,1)\n",
+    "so_scaled = scaler_lstm.fit_transform(so_data)\n",
+    "\n",
+    "seq_length = 4\n",
+    "X, y = create_sequences(so_scaled, seq_length)\n",
+    "\n",
+    "# Traint/test split\n",
+    "train_size = len(X) - 12\n",
+    "X_train_lstm, X_test_lstm = X[:train_size], X[train_size:]\n",
+    "y_train_lstm, y_test_lstm = y[:train_size], y[train_size:]\n",
+    "\n",
+    "# Compiling and fitting LSTM\n",
+    "model_lstm = Sequential()\n",
+    "model_lstm.add(LSTM(64, input_shape=(seq_length, 1)))\n",
+    "model_lstm.add(Dense(1))  # Output - 1 value for sequence of 4\n",
+    "\n",
+    "model_lstm.compile(optimizer='adam', loss='mse')\n",
+    "\n",
+    "model_lstm.fit(X_train_lstm, y_train_lstm, epochs=50, batch_size=32, verbose=0)\n",
+    "\n",
+    "# Predict on test dataset\n",
+    "predictions = []\n",
+    "last_sequence = X_test_lstm[0]\n",
+    "for _ in range(12):\n",
+    "    pred = model_lstm.predict(last_sequence.reshape(1, seq_length, 1), verbose=0)\n",
+    "    predictions.append(pred[0, 0])\n",
+    "    last_sequence = np.roll(last_sequence, -1)\n",
+    "    last_sequence[-1] = pred\n",
+    "\n",
+    "# Back Scaler\n",
+    "predictions = scaler_lstm.inverse_transform(np.array(predictions).reshape(-1,1))\n",
+    "y_true = df_filtered.groupby('Calendar Year/Week')['SO'].sum().values[-12:]\n",
+    "\n",
+    "metrics_lstm = {\n",
+    "    'accuracy': 1 - (np.abs(y_true - predictions.flatten()).sum() / y_true.sum()),\n",
+    "    'mse': mean_squared_error(y_true, predictions),\n",
+    "    'mae': mean_absolute_error(y_true, predictions)\n",
+    "}"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "05d2ce3d",
+   "metadata": {},
+   "source": [
+    "# Collecting Results"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "d1291244",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "metrics_data = []\n",
+    "\n",
+    "if metrics_arima:\n",
+    "    metrics_data.append(['ARIMA', metrics_arima['accuracy'], metrics_arima['mse'], metrics_arima['mae'], metrics_arima.get('aic')])\n",
+    "if metrics_hw:\n",
+    "    metrics_data.append(['Holt-Winters', metrics_hw['accuracy'], metrics_hw['mse'], metrics_hw['mae'], metrics_hw.get('aic')])\n",
+    "if metrics_lr:\n",
+    "    metrics_data.append(['Линейная регрессия', metrics_lr['accuracy'], metrics_lr['mse'], metrics_lr['mae'], None])\n",
+    "if metrics_xgb:\n",
+    "    metrics_data.append(['XGBoost', metrics_xgb['accuracy'], metrics_xgb['mse'], metrics_xgb['mae'], None])\n",
+    "if metrics_rf:\n",
+    "    metrics_data.append(['Random Forest', metrics_rf['accuracy'], metrics_rf['mse'], metrics_rf['mae'], None])\n",
+    "if metrics_lstm:\n",
+    "    metrics_data.append(['LSTM', metrics_lstm['accuracy'], metrics_lstm['mse'], metrics_lstm['mae'], None])\n",
+    "\n",
+    "metrics_df = pd.DataFrame(metrics_data, columns=['Модель', 'Accuracy', 'MSE', 'MAE', 'AIC'])\n",
+    "metrics_df = metrics_df.sort_values('Accuracy', ascending=False).reset_index(drop=True)\n",
+    "\n",
+    "# Comparison reviewed models by accuracy on test data\n",
+    "plt.figure(figsize=(12, 6))\n",
+    "sns.barplot(data=metrics_df, x='Accuracy', y='Модель', palette='viridis')\n",
+    "plt.title('Comparison Models by Accuracy')\n",
+    "plt.grid(True, linestyle='--', alpha=0.7)\n",
+    "plt.tight_layout()\n",
+    "plt.show()"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.4"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
